@@ -1,0 +1,324 @@
+#!/bin/sh
+# Copyright Sandvine Inc. All rights reserved.
+#
+# Remaps GIDs of Sandvine groups to standard GIDs.
+
+# This scripts is supported on Linux platform alone.
+if [ "$(uname)" != "Linux" ] ; then
+    echo "Unsupported platform"
+    exit 1
+fi
+
+usage()
+{
+    cat - <<EOF
+
+# $(basename $0) [-h] [-p <source-GID>] <group-name> [<target-GID>]
+# 
+# Remap the local group <group-name> from its current GID to <target-GID>.
+# 
+# <group-name> must be a symbolic name, not a GID.
+# <source-GID> and <target-GID> must be numbers.
+# 
+# To remap a group from its current GID to <target-GID>, including updating all files:
+# $(basename $0) <group-name> <target-GID>
+# 
+# To change files owned by (possibly old) <source-GID> to current GID of <group-name>:
+# $(basename $0) -p <source-GID> <group-name>
+# 
+# The /etc/group and /etc/passwd files will be updated to reflect the change. All
+# files on the root partition will have their ownerships updated.
+# 
+#     -h               Print help message.
+#     -p <source-GID>  Intended to be run after a reboot when remapping GIDs.
+#                      Do not modify /etc/group or /etc/passwd, and instead only
+#                      modify the ownership information of files from the root
+#                      partition. Must provide previous source GID as it cannot
+#                      be determined from the /etc/group file.
+# 
+# Some features and functionality require that all Sandvine group IDs need to be consistent.
+# 
+# These are the GIDs reserved for Sandvine groups on all the Sandvine elements.
+# sv_admin	197
+# sv_service	198
+# sv_operator	199
+# 
+# In case Sandvine GIDs are not aligned with above mapping, then GIDs have to be 
+# remapped and file ownerships have to be modified so that they align with above 
+# mapping.
+# 
+# ###########################################
+# ## Example Walk-through Workflow
+# ###########################################
+# 
+# Get current Sandvine GIDs:
+# =========================
+# grep '^sv_' /etc/group | cut -d: -f1,3
+# sv_admin:1000
+# sv_operator:1002
+# sv_service:1001
+# 
+# # Take note of above Sandvine GIDs.
+# 
+# Re-map GIDs of Sandvine groups:
+# ==============================
+# remapgid sv_admin 197
+# remapgid sv_service 198
+# remapgid sv_operator 199
+# 
+# Restart Sandvine element:
+# ========================
+# shutdown -r now
+# 
+# Final cleanup, handling any stale file ownerships post-restart:
+# =============================================================
+# # Supply the previously noted group IDs.
+# remapgid -p 1000 sv_admin
+# remapgid -p 1001 sv_service
+# remapgid -p 1002 sv_operator
+
+EOF
+}
+
+#################################################################################################
+# This is a simple and quick logging support function. The message will always be logged to svlog.
+# Printing to stdout/stderr depends on the arguments mentioned below.
+# message to stdout/stderr.
+# Globals:
+#     None
+# Arguments:
+#     $1 - [INFO/ERROR] Decides whether to output to stdout or stderr.
+#     $2 - [true/false] Enables printing message to terminal.
+#     $3 - Message to be logged/printed to terminal.
+# Returns :
+#     None
+##################################################################################################
+log()
+{
+    logType=$1
+    printToTerminal=$2
+    logMessage="$3"
+
+    # As per Syslog configuration any log logged to local5 facility will be logged to svlog.
+    if [ $logType = "INFO" ] ; then
+        facility="local5.info"
+    else
+        facility="local5.error"
+    fi
+
+    logger -t remapgid -p "$facility" -- "$logMessage"
+
+    if [ $printToTerminal == true ] ; then
+        if [ $logType == "ERROR" ]; then
+            echo $3 >&2
+        else
+            echo $3
+        fi
+    fi
+}
+
+#################################################################
+# Determines whether passed in argument is a numberical or not.
+# Globals:
+#    None
+# Argument:
+#    $1 - Strings,Numericals etc 
+# Returns:
+#    0 - if the passed argument is a numerical
+#    1 - if the passed argument is not a numerical.
+#################################################################
+isNumeric()
+{
+    if [ "$#" -gt 1 ] ; then
+        echo "Invalid use of function isNumeric." >&2
+        exit 1
+    fi
+
+    if ! ([ "$1" -gt 0 ] || [ "$1" -le 0 ]) 2>/dev/null ; then
+        return 1
+    fi
+    return 0
+}
+
+#####################################################################################################################################
+# Modifies group ID info from the specified source (current) GID to the specified target GID by modifying the group and passwd files.
+# Globals:
+#     None
+# Arguments:
+#     $1 - Name of the group to be modified.
+#     $2 - Current GID of the group.
+#     $3 - Target GID, CurrentGid should be modified to TargetGid.
+#     $4 - groupFile (/etc/group).
+#     $5 - passwdFile (/etc/passwd).
+# Returns:
+#     0 - in case of success.
+#     1 - in case of failure.
+#######################################################################################################################################
+modGroup()
+{
+    local groupName=$1
+    local sourceGid=$2
+    local targetGid=$3
+    local groupFile=$4
+    local passwdFile=$5
+
+    # Perform the group modification using a system utility that is available to us.
+    # This method attempts to leverage one of three methods for group modification, starting in order with the most desired being the least complicated
+    # and ending with the least desired being the most complicated.
+    # 1. groupmod - Linux
+    # 2. no tools - manual
+
+    # If groupmod exists, use it. It will automatically handle the /etc/passwd file as well.
+    if which groupmod >/dev/null 2>&1 ; then
+        # groupmod is fully functional, modifies both /etc/group and /etcpasswd for us, if successful, exit immediately
+        log "INFO" true "Updating $groupFile and $passwdFile... "
+
+        if ! GROUPMOD_OUT=$(groupmod -g $targetGid $groupName 2>&1); then
+            log "ERROR" true "Error Modifying GID of $groupName using \"groupmod\" utility, hit with following issue:$GROUPMOD_OUT"
+            return 1
+        fi
+
+        echo "Done."
+        return 0
+    else
+        # No tools available. Edit the /etc/group file manually to reflect new GID.
+        # Example:
+        #         sv_admin:x:132123:sv
+        sed -i -e '/^'$groupName':/ s/^\('$groupName':[^:]*:\)'$sourceGid':/\1'$targetGid':/' $groupFile
+    fi
+    echo "Done."
+
+    log "INFO" true "Updating $passwdFile... "
+
+    # Now update /etc/passwd for all users who had the moved group as their primary group
+    # Example:
+    #        sv_admin:x:1000:132123:Sandvine Administrator:/home/sv_admin:/bin/bash
+    sed -i -e '/\([^:]*:\)\{3\}'$sourceGid'/ s/^\(\([^:]*:\)\{3\}\)'$sourceGid':/\1'$targetGid':/' $passwdFile
+    echo "Done."
+
+    return 0
+}
+
+###############################################################
+# Modifies file ownership to align with already modified GIDs.
+# Globals:
+#     None
+# Arguments:
+#     $1 - Name of the re-mapped group.
+#     $2 - Original GID of the group before re-mapping.
+# Returns:
+#     None
+###############################################################
+modFiles()
+{
+    local groupName=$1
+    local sourceGid=$2
+
+    log "INFO" true "Updating all files on /... "
+    find / -xdev -gid $sourceGid -exec chown -h :$groupName '{}' \;
+    echo "Done."
+}
+
+
+SVGROUPS="sv_admin sv_service sv_operator"
+GROUP_FILE="/etc/group"
+PASSWD_FILE="/etc/passwd"
+permOnlyGid=
+
+# Assert we are running as root
+if [ "$(id -u)" -ne 0 ] ; then
+    echo "Root permissions required to change group mappings." >&2
+    exit 1
+fi
+
+while getopts hp:-: o; do
+    case "$o" in
+        h)
+            usage
+            exit 0
+        ;;
+        p)
+            permOnlyGid=$OPTARG
+        ;;
+        -)
+            case "$OPTARG" in
+                -help)
+                    usage
+                    exit 0
+                ;;
+            esac
+        ;;
+    esac
+done
+shift $((OPTIND - 1))
+OPTIND=1
+
+# Name our positional parameters for future reference
+groupName="$1"
+targetGid="$2"
+
+# Assert there are the correct number of parameters
+if [ -z "$permOnlyGid" ] && [ "$#" -ne 2 ] ; then
+    usage
+    exit 1
+elif [ -n "$permOnlyGid" ] && [ "$#" -ne 1 ] ; then
+    usage
+    exit 1
+fi
+
+# Assert that groupName is not numeric and that targetGid is. We know they are
+# not zero length because of the check above.
+if isNumeric "$groupName" ||
+        ([ -z "$permOnlyGid" ] && ! isNumeric "$targetGid") ||
+        ([ -n "$permOnlyGid" ] && ! isNumeric "$permOnlyGid") ; then
+    echo "Incorrect paramater types" >&2
+    usage
+    exit 1
+fi
+
+# If we are provided a permOnlyGid we need to update permissions and exit
+if [ -n "$permOnlyGid" ] ; then
+    modFiles $groupName $permOnlyGid
+    exit 0
+fi
+
+groupEnt="$(getent group $groupName)"
+# Ensure the group exists and is accessible by NSS
+if [ -z "$groupEnt" ] ; then
+    log "ERROR" true "Group \"$groupName\" does not appear to have an entry in any NSS group database."
+    exit 1
+fi
+
+# Assert that it is indeed a local group by confirming the line exists in /etc/group
+if ! grep -q "$groupEnt" $GROUP_FILE ; then
+    log "ERROR" true "Group \"$groupName\" does not appear to be a system local group."
+    exit 1
+fi
+
+# Assert target GID is not already in use if we aren't just modifying permissions
+# Make sure this condition is always called, before calling out modGroup/modFiles,
+# this is necessary condition to be met before modifying groupIds or file permissions.
+existingGroup=$(cut -d: -f1,3 $GROUP_FILE | grep -e ":$targetGid$" | wc -l)
+if [ "$existingGroup" -gt 0 ] ; then
+    targetGroup="$(cut -d: -f1,3 $GROUP_FILE | grep -e ":$targetGid$" | cut -d: -f1)"
+    log "ERROR" true "Target GID ($targetGid) is currently in use by group \"$targetGroup\"."
+    exit 1
+fi
+
+# Acquire source GID, if there is a invalid GID attached to $groupName then log it.
+sourceGid=$(echo $groupEnt | cut -d: -f3)
+if [ -z "$sourceGid" ] || ! [ "$sourceGid" -gt 0 ] 2>/dev/null ; then
+    log "ERROR" true "Unable to extract GID from local group \"$groupName\"."
+fi
+
+log "INFO" true "Remapping ${groupName}'s ID from source GID: $sourceGid, to target GID: $targetGid"
+
+# Edit the /etc/group file to reflect new GID if we aren't in permOnly mode
+if ! modGroup $groupName $sourceGid $targetGid $GROUP_FILE $PASSWD_FILE ; then
+    exit 1
+fi
+
+log "INFO" true "Cleaning up stale file ownership (old GID: $sourceGid) for $groupName"
+
+# Change permissions of all files on the local system that reference the source GID
+modFiles $groupName $sourceGid
